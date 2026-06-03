@@ -1,0 +1,2244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pixel Speedrun - Dead Cells Inspired</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { display: block; image-rendering: pixelated; border: 2px solid #333; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ============================================================
+// PIXEL SPEEDRUN GAME - Dead Cells Inspired
+// ============================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const GAME_W = 960;
+const GAME_H = 540;
+canvas.width = GAME_W;
+canvas.height = GAME_H;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+const GRAVITY = 0.55;
+const PLAYER_SPEED = 4.5;
+const JUMP_FORCE = -13;
+const DASH_SPEED = 14;
+const DASH_DURATION = 12;
+const DASH_COOLDOWN = 45;
+const GROUND_Y = GAME_H - 80;
+const TILE_SIZE = 32;
+
+// Biome color palettes
+const BIOMES = [
+  { name:'Dungeon', bg:'#0a0a12', fg:'#1a1a2e', floor:'#2d2d4a', accent:'#4a3f6b', torch:'#ff6a00' },
+  { name:'Forest', bg:'#071207', fg:'#0d2010', floor:'#1a3d1a', accent:'#2d6e2d', torch:'#aaff00' },
+  { name:'Castle', bg:'#120808', fg:'#1e0f0f', floor:'#3d1a1a', accent:'#6e2d2d', torch:'#ff4400' },
+];
+
+// ============================================================
+// INPUT
+// ============================================================
+const keys = {};
+const justPressed = {};
+const justReleased = {};
+
+window.addEventListener('keydown', e => {
+  if (!keys[e.code]) justPressed[e.code] = true;
+  keys[e.code] = true;
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  justReleased[e.code] = true;
+  e.preventDefault();
+});
+
+function clearJust() {
+  for (let k in justPressed) delete justPressed[k];
+  for (let k in justReleased) delete justReleased[k];
+}
+
+// ============================================================
+// MATH UTILITIES
+// ============================================================
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function dist(ax, ay, bx, by) { return Math.sqrt((bx-ax)**2+(by-ay)**2); }
+
+function rectsOverlap(ax,ay,aw,ah, bx,by,bw,bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+// ============================================================
+// PARTICLES
+// ============================================================
+const particles = [];
+
+function spawnParticles(x, y, count, color, vxRange=4, vyRange=4, life=40, size=3) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: rand(-vxRange, vxRange),
+      vy: rand(-vyRange, vyRange),
+      color, life, maxLife: life,
+      size: rand(size*0.5, size*1.5)
+    });
+  }
+}
+
+function spawnBlood(x, y, count=8) {
+  spawnParticles(x, y, count, '#cc2200', 5, 6, 35, 3);
+}
+
+function spawnGold(x, y) {
+  spawnParticles(x, y, 5, '#ffd700', 3, 4, 50, 4);
+}
+
+function spawnExplosion(x, y) {
+  spawnParticles(x, y, 20, '#ff6600', 7, 7, 50, 5);
+  spawnParticles(x, y, 15, '#ffcc00', 5, 5, 35, 3);
+  spawnParticles(x, y, 10, '#ff2200', 4, 4, 25, 4);
+}
+
+function updateParticles() {
+  for (let i = particles.length-1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.2;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// DAMAGE NUMBERS
+// ============================================================
+const dmgNumbers = [];
+
+function spawnDmgNumber(x, y, dmg, color='#fff', crit=false) {
+  dmgNumbers.push({ x, y, vy: -2, dmg, color, life: 60, crit });
+}
+
+function updateDmgNumbers() {
+  for (let i = dmgNumbers.length-1; i >= 0; i--) {
+    const d = dmgNumbers[i];
+    d.y += d.vy;
+    d.vy += 0.05;
+    d.life--;
+    if (d.life <= 0) dmgNumbers.splice(i, 1);
+  }
+}
+
+function drawDmgNumbers() {
+  dmgNumbers.forEach(d => {
+    const alpha = d.life / 60;
+    ctx.globalAlpha = alpha;
+    ctx.font = d.crit ? 'bold 18px monospace' : '13px monospace';
+    ctx.fillStyle = d.color;
+    ctx.textAlign = 'center';
+    ctx.fillText(d.crit ? `!${d.dmg}!` : d.dmg, d.x, d.y);
+  });
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+}
+
+// ============================================================
+// SCREEN SHAKE
+// ============================================================
+let shakeX = 0, shakeY = 0, shakeMag = 0, shakeDuration = 0;
+
+function screenShake(mag, dur) {
+  shakeMag = Math.max(shakeMag, mag);
+  shakeDuration = Math.max(shakeDuration, dur);
+}
+
+function updateShake() {
+  if (shakeDuration > 0) {
+    shakeX = rand(-shakeMag, shakeMag);
+    shakeY = rand(-shakeMag, shakeMag);
+    shakeDuration--;
+    shakeMag *= 0.9;
+  } else {
+    shakeX = 0; shakeY = 0; shakeMag = 0;
+  }
+}
+
+// ============================================================
+// HIT STOP
+// ============================================================
+let hitStopFrames = 0;
+function triggerHitStop(frames) { hitStopFrames = Math.max(hitStopFrames, frames); }
+
+// ============================================================
+// WEAPON DEFINITIONS
+// ============================================================
+const WEAPON_DEFS = {
+  vorpal_sword: {
+    name: 'Vorpal Sword', type: 'melee', icon_color: '#aaddff',
+    damage: [18, 22, 30], comboMax: 3, comboWindow: 30,
+    range: 55, cooldown: 12, arcAngle: Math.PI*0.6,
+    color: '#aaddff', desc: 'Fast 3-hit combo'
+  },
+  war_spear: {
+    name: 'War Spear', type: 'melee', icon_color: '#cc9933',
+    damage: [35], comboMax: 1, comboWindow: 0,
+    range: 90, cooldown: 25, arcAngle: Math.PI*0.2,
+    color: '#cc9933', desc: 'Long reach thrust'
+  },
+  twin_daggers: {
+    name: 'Twin Daggers', type: 'melee', icon_color: '#ff9988',
+    damage: [12, 12, 14, 14], comboMax: 4, comboWindow: 20,
+    range: 40, cooldown: 8, arcAngle: Math.PI*0.5,
+    color: '#ff9988', desc: 'Very fast dual attack'
+  },
+  recurve_bow: {
+    name: 'Recurve Bow', type: 'ranged', icon_color: '#88cc55',
+    damage: 28, cooldown: 30, projSpeed: 14, projColor: '#88cc55',
+    color: '#88cc55', desc: 'Fires arrows'
+  },
+  crossbow: {
+    name: 'Crossbow', type: 'ranged', icon_color: '#cc5533',
+    damage: 55, cooldown: 60, projSpeed: 18, projColor: '#cc5533',
+    color: '#cc5533', desc: 'Slow but devastating'
+  },
+  fire_grenade: {
+    name: 'Fire Grenade', type: 'throwable', icon_color: '#ff6600',
+    damage: 65, cooldown: 90, radius: 80, projSpeed: 10,
+    color: '#ff6600', desc: 'Explodes on impact'
+  },
+  ice_shard: {
+    name: 'Ice Shard', type: 'ranged', icon_color: '#88eeff',
+    damage: 22, cooldown: 25, projSpeed: 12, projColor: '#88eeff',
+    freezeDur: 120, color: '#88eeff', desc: 'Freezes enemies'
+  },
+  lightning_whip: {
+    name: 'Lightning Whip', type: 'melee', icon_color: '#ffff44',
+    damage: [25, 35], comboMax: 2, comboWindow: 25,
+    range: 70, cooldown: 18, arcAngle: Math.PI*0.9,
+    chainLightning: true, color: '#ffff44', desc: 'Chain lightning'
+  },
+  shield: {
+    name: 'Shield', type: 'shield', icon_color: '#778899',
+    damage: 20, cooldown: 30, blockDur: 15,
+    color: '#778899', desc: 'Block & bash counter'
+  },
+  scythe: {
+    name: 'Scythe', type: 'melee', icon_color: '#cc44aa',
+    damage: [40, 50], comboMax: 2, comboWindow: 35,
+    range: 75, cooldown: 28, arcAngle: Math.PI*1.2,
+    color: '#cc44aa', desc: 'Wide sweeping AoE'
+  },
+};
+
+const WEAPON_KEYS = Object.keys(WEAPON_DEFS);
+
+function makeWeapon(key) {
+  return { key, ...WEAPON_DEFS[key], comboStep: 0, comboTimer: 0, cooldownTimer: 0, blockTimer: 0 };
+}
+
+// ============================================================
+// PROJECTILES
+// ============================================================
+const projectiles = [];
+
+function spawnProjectile(x, y, vx, vy, dmg, color, owner, radius=5, freeze=false, isGrenade=false, explosionR=0) {
+  projectiles.push({ x, y, vx, vy, dmg, color, owner, radius, freeze, isGrenade, explosionR,
+    life: 120, active: true });
+}
+
+function updateProjectiles(platforms, player, enemies) {
+  for (let i = projectiles.length-1; i >= 0; i--) {
+    const p = projectiles[i];
+    if (!p.active) { projectiles.splice(i,1); continue; }
+    p.x += p.vx;
+    p.y += p.vy;
+    if (p.isGrenade) p.vy += 0.4;
+    p.life--;
+
+    // Hit ground / platforms
+    let hitGround = false;
+    if (p.y > GROUND_Y) hitGround = true;
+    platforms.forEach(pl => {
+      if (p.x >= pl.x && p.x <= pl.x+pl.w && p.y >= pl.y && p.y <= pl.y+8) hitGround = true;
+    });
+
+    if (hitGround || p.life <= 0) {
+      if (p.isGrenade) {
+        // explode
+        spawnExplosion(p.x, p.y);
+        screenShake(8, 12);
+        enemies.forEach(e => {
+          if (!e.dead && dist(e.x+e.w/2, e.y+e.h/2, p.x, p.y) < p.explosionR) {
+            enemyTakeDamage(e, p.dmg, 0);
+          }
+        });
+        if (p.owner !== 'player' && dist(player.x+player.w/2, player.y+player.h/2, p.x, p.y) < p.explosionR) {
+          playerTakeDamage(p.dmg * 0.5);
+        }
+      }
+      projectiles.splice(i,1);
+      continue;
+    }
+
+    // Hit enemies (player projectile)
+    if (p.owner === 'player') {
+      for (let ei = enemies.length-1; ei >= 0; ei--) {
+        const e = enemies[ei];
+        if (e.dead) continue;
+        if (rectsOverlap(p.x-p.radius, p.y-p.radius, p.radius*2, p.radius*2,
+                         e.x, e.y, e.w, e.h)) {
+          enemyTakeDamage(e, p.dmg, p.vx > 0 ? 1 : -1);
+          if (p.freeze) e.frozenTimer = Math.max(e.frozenTimer||0, 120);
+          spawnBlood(p.x, p.y);
+          if (!p.isGrenade) { projectiles.splice(i,1); break; }
+        }
+      }
+    }
+
+    // Hit player (enemy projectile)
+    if (p.owner === 'enemy') {
+      if (rectsOverlap(p.x-p.radius, p.y-p.radius, p.radius*2, p.radius*2,
+                       player.x, player.y, player.w, player.h)) {
+        if (!player.invincible && !player.blocking) {
+          playerTakeDamage(p.dmg);
+          spawnBlood(player.x+player.w/2, player.y+player.h/2);
+          projectiles.splice(i,1);
+        }
+      }
+    }
+  }
+}
+
+function drawProjectiles() {
+  projectiles.forEach(p => {
+    ctx.fillStyle = p.color;
+    if (p.isGrenade) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.radius+2, 0, Math.PI*2);
+      ctx.fill();
+      // fuse spark
+      ctx.fillStyle = '#ffff00';
+      ctx.fillRect(p.x-1, p.y-p.radius-6, 3, 4);
+    } else {
+      // arrow/projectile
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      const angle = Math.atan2(p.vy, p.vx);
+      ctx.rotate(angle);
+      ctx.fillRect(-p.radius*2, -2, p.radius*4, 4);
+      ctx.restore();
+      // glow
+      ctx.globalAlpha = 0.3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.radius+3, 0, Math.PI*2);
+      ctx.fillStyle = p.color;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  });
+}
+
+// ============================================================
+// PLAYER
+// ============================================================
+const player = {
+  x: 80, y: 200, w: 24, h: 36,
+  vx: 0, vy: 0,
+  onGround: false,
+  jumpsLeft: 2,
+  facing: 1, // 1=right, -1=left
+  hp: 100, maxHp: 100,
+  invincible: false, invTimer: 0,
+  dashTimer: 0, dashCooldown: 0,
+  isDashing: false,
+  blocking: false,
+  weapons: [makeWeapon('vorpal_sword'), null],
+  weaponSlot: 0,
+  attackTimer: 0,
+  attackHitboxes: [],
+  gold: 0,
+  kills: 0,
+  dead: false,
+  deathTimer: 0,
+  walkAnim: 0,
+  attackAnim: 0,
+  rollTimer: 0,
+};
+
+function playerTakeDamage(dmg) {
+  if (player.invincible || player.dead) return;
+  player.hp -= dmg;
+  player.invincible = true;
+  player.invTimer = 30;
+  screenShake(6, 10);
+  spawnDmgNumber(player.x+player.w/2, player.y, dmg, '#ff4444');
+  if (player.hp <= 0) {
+    player.hp = 0;
+    player.dead = true;
+    player.deathTimer = 120;
+    spawnExplosion(player.x+player.w/2, player.y+player.h/2);
+    gameState = 'gameover';
+  }
+}
+
+function updatePlayer(platforms) {
+  if (player.dead) return;
+
+  // Invincibility
+  if (player.invincible) {
+    player.invTimer--;
+    if (player.invTimer <= 0) player.invincible = false;
+  }
+
+  // Dash cooldown
+  if (player.dashCooldown > 0) player.dashCooldown--;
+
+  // Combo timer
+  const w = player.weapons[player.weaponSlot];
+  if (w) {
+    if (w.comboTimer > 0) {
+      w.comboTimer--;
+      if (w.comboTimer <= 0) w.comboStep = 0;
+    }
+    if (w.cooldownTimer > 0) w.cooldownTimer--;
+  }
+
+  // Attack timer
+  if (player.attackTimer > 0) {
+    player.attackTimer--;
+    player.attackAnim = player.attackTimer;
+  }
+
+  // Weapon switch
+  if (justPressed['KeyQ']) {
+    player.weaponSlot = player.weaponSlot === 0 ? 1 : 0;
+  }
+
+  // Blocking
+  player.blocking = false;
+  const cw = player.weapons[player.weaponSlot];
+  if (cw && cw.type === 'shield' && keys['KeyS']) {
+    player.blocking = true;
+    cw.blockTimer = cw.blockDur;
+  }
+
+  // Movement
+  if (!player.isDashing) {
+    if (keys['ArrowLeft'] || keys['KeyA']) {
+      player.vx = -PLAYER_SPEED;
+      player.facing = -1;
+    } else if (keys['ArrowRight'] || keys['KeyD']) {
+      player.vx = PLAYER_SPEED;
+      player.facing = 1;
+    } else {
+      player.vx *= 0.7;
+    }
+  }
+
+  // Jump
+  if ((justPressed['Space'] || justPressed['ArrowUp'] || justPressed['KeyW']) && player.jumpsLeft > 0) {
+    player.vy = JUMP_FORCE;
+    player.jumpsLeft--;
+    spawnParticles(player.x+player.w/2, player.y+player.h, 5, '#aaaaaa', 2, 1, 15, 3);
+  }
+
+  // Dash
+  if (justPressed['ShiftLeft'] || justPressed['ShiftRight']) {
+    if (player.dashCooldown <= 0) {
+      player.isDashing = true;
+      player.dashTimer = DASH_DURATION;
+      player.dashCooldown = DASH_COOLDOWN;
+      player.invincible = true;
+      player.invTimer = DASH_DURATION + 5;
+      player.vx = DASH_SPEED * player.facing;
+      player.vy = Math.min(player.vy, 0);
+      spawnParticles(player.x+player.w/2, player.y+player.h/2, 12, '#4488ff', 3, 3, 20, 4);
+    }
+  }
+
+  if (player.isDashing) {
+    player.dashTimer--;
+    if (player.dashTimer <= 0) {
+      player.isDashing = false;
+      player.vx = player.facing * PLAYER_SPEED;
+    }
+  }
+
+  // Attack
+  if ((justPressed['KeyJ'] || justPressed['KeyZ'] || justPressed['Mouse0']) && !player.blocking) {
+    doPlayerAttack();
+  }
+
+  // Gravity
+  if (!player.isDashing) player.vy += GRAVITY;
+  player.x += player.vx;
+  player.y += player.vy;
+
+  // Platform collision
+  player.onGround = false;
+  platforms.forEach(pl => {
+    if (player.vy >= 0 &&
+        player.x + player.w > pl.x + 4 &&
+        player.x < pl.x + pl.w - 4 &&
+        player.y + player.h > pl.y &&
+        player.y + player.h < pl.y + pl.h + 15) {
+      player.y = pl.y - player.h;
+      player.vy = 0;
+      player.onGround = true;
+      player.jumpsLeft = 2;
+    }
+  });
+
+  // World bounds
+  if (player.x < 0) player.x = 0;
+  if (player.x + player.w > GAME_W) player.x = GAME_W - player.w;
+
+  // Walk animation
+  if (Math.abs(player.vx) > 0.5) player.walkAnim += 0.2;
+}
+
+function doPlayerAttack() {
+  const w = player.weapons[player.weaponSlot];
+  if (!w || w.cooldownTimer > 0) return;
+
+  w.cooldownTimer = w.cooldown;
+
+  if (w.type === 'melee') {
+    const step = w.comboStep % w.comboMax;
+    const dmg = w.damage[step];
+    w.comboStep = (step + 1) % w.comboMax;
+    w.comboTimer = w.comboWindow;
+    player.attackTimer = 15;
+
+    // Create hitbox
+    const hx = player.facing > 0 ? player.x + player.w : player.x - w.range;
+    const hy = player.y - 10;
+    player.attackHitboxes.push({
+      x: hx, y: hy, w: w.range, h: player.h + 20,
+      dmg, life: 8, facing: player.facing,
+      weapon: w.key, color: w.color
+    });
+
+    spawnParticles(
+      player.x + player.w/2 + player.facing*30,
+      player.y + player.h/2,
+      6, w.color, 3, 3, 20, 4
+    );
+
+    if (w.chainLightning) {
+      // Lightning visual
+      for (let i=0; i<5; i++) spawnParticles(
+        player.x + player.facing*(30+i*10), player.y + player.h/2,
+        3, '#ffff44', 2, 2, 15, 3
+      );
+    }
+
+  } else if (w.type === 'ranged' || w.key === 'ice_shard') {
+    const vx = player.facing * w.projSpeed;
+    const vy = (keys['ArrowUp']||keys['KeyW']) ? -8 : 0;
+    spawnProjectile(
+      player.x + player.w/2, player.y + player.h/2,
+      vx, vy, w.damage, w.projColor, 'player', 5,
+      w.key === 'ice_shard', false, 0
+    );
+    player.attackTimer = 10;
+    spawnParticles(player.x+player.w/2+player.facing*20, player.y+player.h/2, 4, w.projColor, 2, 2, 15, 3);
+
+  } else if (w.type === 'throwable') {
+    const vx = player.facing * w.projSpeed;
+    spawnProjectile(
+      player.x+player.w/2, player.y+player.h/2,
+      vx, -8, w.damage, w.color, 'player', 8,
+      false, true, w.radius
+    );
+    player.attackTimer = 10;
+
+  } else if (w.type === 'shield') {
+    // Shield bash
+    const hx = player.facing > 0 ? player.x+player.w : player.x-40;
+    player.attackHitboxes.push({
+      x: hx, y: player.y-5, w: 40, h: player.h+10,
+      dmg: w.damage, life: 10, facing: player.facing,
+      weapon: w.key, color: w.color
+    });
+    player.attackTimer = 10;
+  }
+}
+
+function updatePlayerHitboxes(enemies) {
+  for (let hi = player.attackHitboxes.length-1; hi >= 0; hi--) {
+    const hb = player.attackHitboxes[hi];
+    hb.life--;
+
+    enemies.forEach(e => {
+      if (e.dead || e.hitBy === hb) return;
+      if (rectsOverlap(hb.x, hb.y, hb.w, hb.h, e.x, e.y, e.w, e.h)) {
+        // Shield guard blocks from front
+        if (e.type === 'shield_guard' && e.facing === -hb.facing) return;
+        e.hitBy = hb;
+        enemyTakeDamage(e, hb.dmg, hb.facing);
+        spawnBlood(e.x+e.w/2, e.y+e.h/2);
+        triggerHitStop(3);
+      }
+    });
+
+    if (hb.life <= 0) player.attackHitboxes.splice(hi, 1);
+  }
+}
+
+function drawPlayer() {
+  if (player.dead) return;
+  const px = Math.round(player.x);
+  const py = Math.round(player.y);
+
+  // Invincibility flash
+  if (player.invincible && Math.floor(player.invTimer / 3) % 2 === 0) {
+    ctx.globalAlpha = 0.4;
+  }
+
+  // Shadow
+  ctx.globalAlpha *= 0.3;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(px+2, py+player.h-4, player.w-4, 6);
+  ctx.globalAlpha = player.invincible && Math.floor(player.invTimer / 3) % 2 === 0 ? 0.4 : 1;
+
+  const f = player.facing;
+  const bobY = player.onGround ? Math.sin(player.walkAnim) * 2 : 0;
+
+  // Body (torso)
+  ctx.fillStyle = '#cc3333';
+  ctx.fillRect(px+4, py+10+bobY, 16, 14);
+
+  // Head
+  ctx.fillStyle = '#e8c090';
+  ctx.fillRect(px+5, py+bobY, 14, 12);
+  // Eyes
+  ctx.fillStyle = '#111';
+  ctx.fillRect(px + (f>0?13:7), py+4+bobY, 3, 3);
+
+  // Legs
+  ctx.fillStyle = '#442266';
+  const legOff = player.onGround ? Math.sin(player.walkAnim)*4 : 0;
+  ctx.fillRect(px+4, py+24+bobY, 7, 12-legOff);
+  ctx.fillRect(px+13, py+24+bobY, 7, 12+legOff);
+
+  // Arms
+  ctx.fillStyle = '#e8c090';
+  const armSwing = player.attackAnim > 0 ? 8 * f : Math.sin(player.walkAnim)*4;
+  ctx.fillRect(px + (f>0 ? 16 : 0), py+11+bobY, 6, 10);
+
+  // Weapon visual
+  const w = player.weapons[player.weaponSlot];
+  if (w) drawWeaponOnPlayer(px, py+bobY, w, f, player.attackAnim);
+
+  // Dashing trail
+  if (player.isDashing) {
+    ctx.globalAlpha = 0.2;
+    ctx.fillStyle = '#4488ff';
+    ctx.fillRect(px - f*10, py, player.w, player.h);
+    ctx.globalAlpha = 1;
+  }
+
+  // Blocking shield
+  if (player.blocking) {
+    ctx.fillStyle = '#778899';
+    ctx.fillRect(px + (f>0 ? player.w : -12), py+5, 12, 24);
+    ctx.fillStyle = '#aabbcc';
+    ctx.fillRect(px + (f>0 ? player.w+2 : -10), py+8, 8, 8);
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+function drawWeaponOnPlayer(px, py, w, f, atkAnim) {
+  const wAngle = atkAnim > 0 ? (f * Math.PI/4) : 0;
+  ctx.save();
+  ctx.translate(px + player.w/2, py + 18);
+  ctx.rotate(wAngle);
+
+  const c = w.color;
+  ctx.fillStyle = c;
+
+  switch(w.key) {
+    case 'vorpal_sword':
+    case 'war_spear':
+      ctx.fillRect(f>0?0:-40, -3, 40, 5);
+      ctx.fillStyle = '#aaa';
+      ctx.fillRect(f>0?-4:-4, -6, 8, 10);
+      break;
+    case 'twin_daggers':
+      ctx.fillRect(f>0?2:-18, -2, 16, 4);
+      ctx.fillRect(f>0?2:-18, -8, 16, 4);
+      break;
+    case 'scythe':
+      ctx.fillRect(f>0?0:-35, -2, 35, 4);
+      ctx.beginPath();
+      ctx.arc(f>0?35:-35, -8, 12, 0, Math.PI);
+      ctx.fillStyle = c;
+      ctx.fill();
+      break;
+    case 'recurve_bow':
+    case 'crossbow':
+      ctx.fillStyle = c;
+      ctx.fillRect(f>0?5:-15, -10, 10, 20);
+      ctx.strokeStyle = '#cc9933';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(f>0?5:5, -10);
+      ctx.lineTo(f>0?5:5, 10);
+      ctx.stroke();
+      break;
+    case 'lightning_whip':
+      for (let i=0;i<5;i++) {
+        ctx.fillStyle = i%2===0?'#ffff44':'#ff8800';
+        ctx.fillRect(f>0?(i*8):(-(i*8+8)), -2+Math.sin(Date.now()/100+i)*3, 8, 4);
+      }
+      break;
+    case 'fire_grenade':
+      ctx.beginPath();
+      ctx.arc(f>0?15:-15, 0, 8, 0, Math.PI*2);
+      ctx.fillStyle = '#ff6600';
+      ctx.fill();
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillRect(f>0?13:-16, -12, 4, 6);
+      break;
+    case 'shield':
+      ctx.fillStyle = '#778899';
+      ctx.fillRect(f>0?4:-20, -14, 16, 28);
+      ctx.fillStyle = '#aabbcc';
+      ctx.fillRect(f>0?6:-18, -8, 12, 10);
+      break;
+    default:
+      ctx.fillRect(f>0?0:-30, -3, 30, 5);
+  }
+  ctx.restore();
+}
+
+// ============================================================
+// ENEMY BASE
+// ============================================================
+function enemyTakeDamage(e, dmg, kbDir=0) {
+  if (e.dead || e.frozenTimer > 0 && dmg < 5) return;
+  e.hp -= dmg;
+  e.flashTimer = 8;
+  e.vx = kbDir * 5;
+  spawnDmgNumber(e.x+e.w/2, e.y-5, Math.round(dmg), '#fff', dmg > 40);
+  if (e.hp <= 0) killEnemy(e);
+}
+
+function killEnemy(e) {
+  e.dead = true;
+  e.deathTimer = 20;
+  spawnBlood(e.x+e.w/2, e.y+e.h/2, 15);
+  spawnGold(e.x+e.w/2, e.y+e.h/2);
+  spawnParticles(e.x+e.w/2, e.y+e.h/2, 12, e.color||'#888', 5, 5, 30, 4);
+  player.kills++;
+  player.gold += randInt(3,10);
+  screenShake(3, 5);
+}
+
+// ============================================================
+// ENEMY TYPES
+// ============================================================
+function makeZombie(x, y) {
+  return { type:'zombie', x, y, w:28, h:36, vx:0, vy:0, hp:30, maxHp:30,
+    speed:1.2, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#44aa44',
+    attackCooldown:0, walkAnim:0, aggroRange:300, hitBy:null };
+}
+
+function makeSkelArcher(x, y) {
+  return { type:'skel_archer', x, y, w:24, h:34, vx:0, vy:0, hp:25, maxHp:25,
+    speed:0.8, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#ccbbaa',
+    attackCooldown:0, shootTimer:120, walkAnim:0, aggroRange:400, hitBy:null };
+}
+
+function makeBat(x, y) {
+  return { type:'bat', x, y, w:22, h:16, vx:0, vy:0, hp:20, maxHp:20,
+    speed:2.5, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#664488',
+    attackCooldown:0, diveTimer:0, diveDir:{x:0,y:0}, walkAnim:0, aggroRange:350, hitBy:null };
+}
+
+function makeShieldGuard(x, y) {
+  return { type:'shield_guard', x, y, w:32, h:40, vx:0, vy:0, hp:50, maxHp:50,
+    speed:1.0, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#778899',
+    attackCooldown:0, blockCooldown:0, walkAnim:0, aggroRange:280, hitBy:null };
+}
+
+function makeExplodeZombie(x, y) {
+  return { type:'explode_zombie', x, y, w:28, h:34, vx:0, vy:0, hp:35, maxHp:35,
+    speed:2.0, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#aacc00',
+    attackCooldown:0, fuseTimer:0, exploding:false, walkAnim:0, aggroRange:320, hitBy:null };
+}
+
+function makeSpecter(x, y) {
+  return { type:'specter', x, y, w:26, h:36, vx:0, vy:0, hp:40, maxHp:40,
+    speed:2.2, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#aa88ff',
+    attackCooldown:0, teleportTimer:180, walkAnim:0, aggroRange:400, hitBy:null,
+    alpha:0.7 };
+}
+
+// Mini-bosses
+function makeStoneGolem(x, y) {
+  return { type:'stone_golem', x, y, w:56, h:64, vx:0, vy:0, hp:200, maxHp:200,
+    speed:0.8, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#888877',
+    attackCooldown:0, slamTimer:120, throwTimer:200, walkAnim:0, aggroRange:500, hitBy:null };
+}
+
+function makeWitch(x, y) {
+  return { type:'witch', x, y, w:28, h:40, vx:0, vy:0, hp:180, maxHp:180,
+    speed:1.5, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#884488',
+    attackCooldown:0, castTimer:90, summonTimer:300, walkAnim:0, aggroRange:500, hitBy:null };
+}
+
+function makeBerserker(x, y) {
+  return { type:'berserker', x, y, w:34, h:44, vx:0, vy:0, hp:220, maxHp:220,
+    speed:2.5, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#cc4422',
+    attackCooldown:0, chargeTimer:150, charging:false, chargeDir:1, walkAnim:0, aggroRange:500, hitBy:null };
+}
+
+// Main boss
+function makeUndeadKing(x, y) {
+  return { type:'undead_king', x, y, w:60, h:72, vx:0, vy:0, hp:500, maxHp:500,
+    speed:1.8, facing:-1, onGround:false, dead:false, deathTimer:0,
+    flashTimer:0, frozenTimer:0, color:'#ff8844',
+    phase:1, attackCooldown:0, phaseTimer:0, walkAnim:0, aggroRange:800, hitBy:null,
+    swordTimer:60, summonTimer:0, enrageTimer:0 };
+}
+
+// ============================================================
+// ENEMY AI
+// ============================================================
+function updateEnemy(e, platforms, player, enemies) {
+  if (e.dead) {
+    e.deathTimer--;
+    return;
+  }
+
+  if (e.frozenTimer > 0) {
+    e.frozenTimer--;
+    return;
+  }
+
+  if (e.flashTimer > 0) e.flashTimer--;
+  e.hitBy = null;
+
+  const px = player.x + player.w/2;
+  const py = player.y + player.h/2;
+  const ex = e.x + e.w/2;
+  const ey = e.y + e.h/2;
+  const d = dist(ex, ey, px, py);
+  const inRange = d < e.aggroRange;
+  const dir = px > ex ? 1 : -1;
+
+  // Apply gravity (except bats/specter)
+  if (e.type !== 'bat' && e.type !== 'specter') {
+    e.vy += GRAVITY;
+  }
+
+  // Update each enemy type
+  switch(e.type) {
+
+    case 'zombie':
+    case 'shield_guard':
+      if (inRange) {
+        e.facing = dir;
+        e.vx = dir * e.speed;
+        e.walkAnim += 0.15;
+      } else {
+        e.vx *= 0.8;
+      }
+      if (e.attackCooldown > 0) e.attackCooldown--;
+      if (inRange && d < 50 && e.attackCooldown <= 0) {
+        playerTakeDamage(e.type==='shield_guard'?18:12);
+        e.attackCooldown = 60;
+      }
+      break;
+
+    case 'skel_archer':
+      e.walkAnim += 0.1;
+      if (e.shootTimer > 0) e.shootTimer--;
+      if (inRange) {
+        e.facing = dir;
+        // Keep distance
+        if (d < 200) e.vx = -dir * e.speed;
+        else if (d > 350) e.vx = dir * e.speed;
+        else e.vx *= 0.7;
+        if (e.shootTimer <= 0) {
+          const avx = dir * 9;
+          spawnProjectile(ex, ey, avx, 0, 12, '#ccbbaa', 'enemy', 5);
+          e.shootTimer = 120;
+        }
+      } else {
+        e.vx *= 0.8;
+      }
+      break;
+
+    case 'bat':
+      e.walkAnim += 0.2;
+      if (inRange) {
+        if (e.diveTimer <= 0) {
+          // Swoop towards player
+          const ang = Math.atan2(py-ey, px-ex);
+          e.vx = Math.cos(ang) * e.speed * 1.5;
+          e.vy = Math.sin(ang) * e.speed * 1.5;
+          e.facing = dir;
+          if (d < 40) {
+            if (!player.invincible) {
+              playerTakeDamage(8);
+              e.diveTimer = 80;
+            }
+          }
+        } else {
+          e.diveTimer--;
+          e.vx -= e.vx * 0.05;
+          e.vy -= e.vy * 0.05;
+        }
+      } else {
+        // Hover
+        e.vy = Math.sin(Date.now()/500) * 1;
+        e.vx *= 0.95;
+      }
+      // No ground physics for bat
+      e.x += e.vx;
+      e.y += e.vy;
+      e.x = clamp(e.x, 10, GAME_W-e.w-10);
+      e.y = clamp(e.y, 40, GROUND_Y-e.h-20);
+      return; // skip platform physics below
+
+    case 'explode_zombie':
+      if (inRange) {
+        e.facing = dir;
+        if (e.exploding) {
+          e.fuseTimer--;
+          e.vx *= 0.8;
+          if (e.fuseTimer <= 0) {
+            // BOOM
+            spawnExplosion(ex, ey);
+            screenShake(10, 15);
+            if (dist(ex,ey,px,py) < 80) playerTakeDamage(45);
+            e.hp = 0;
+            killEnemy(e);
+          }
+        } else {
+          e.vx = dir * e.speed;
+          e.walkAnim += 0.2;
+          if (d < 60) {
+            e.exploding = true;
+            e.fuseTimer = 60;
+          }
+        }
+      } else {
+        e.vx *= 0.8;
+      }
+      break;
+
+    case 'specter':
+      e.walkAnim += 0.1;
+      if (e.teleportTimer > 0) e.teleportTimer--;
+      if (inRange) {
+        e.facing = dir;
+        if (e.teleportTimer <= 0) {
+          // Teleport near player
+          e.x = player.x + (Math.random()<0.5?-60:60+player.w);
+          e.y = player.y;
+          e.teleportTimer = 180;
+          spawnParticles(e.x+e.w/2, e.y+e.h/2, 15, '#aa88ff', 4, 4, 25, 4);
+        }
+        e.vx = dir * e.speed;
+        if (d < 50 && e.attackCooldown <= 0) {
+          playerTakeDamage(15);
+          e.attackCooldown = 70;
+        }
+      } else {
+        e.vx *= 0.85;
+      }
+      if (e.attackCooldown > 0) e.attackCooldown--;
+      break;
+
+    case 'stone_golem':
+      if (inRange) {
+        e.facing = dir;
+        e.vx = dir * e.speed;
+        e.walkAnim += 0.08;
+        if (e.slamTimer > 0) e.slamTimer--;
+        if (e.throwTimer > 0) e.throwTimer--;
+        if (d < 80 && e.slamTimer <= 0) {
+          // Ground slam
+          screenShake(12, 18);
+          playerTakeDamage(30);
+          spawnParticles(ex, e.y+e.h, 20, '#888877', 6, 3, 30, 6);
+          e.slamTimer = 150;
+        }
+        if (e.throwTimer <= 0) {
+          // Throw rock
+          const rockVx = dir * 7;
+          spawnProjectile(ex, ey-20, rockVx, -4, 25, '#888877', 'enemy', 10);
+          e.throwTimer = 200;
+        }
+      } else {
+        e.vx *= 0.9;
+      }
+      break;
+
+    case 'witch':
+      if (inRange) {
+        e.facing = dir;
+        if (e.castTimer > 0) e.castTimer--;
+        if (e.summonTimer > 0) e.summonTimer--;
+        // Keep distance
+        if (d < 180) e.vx = -dir * e.speed;
+        else if (d > 280) e.vx = dir * e.speed;
+        else e.vx *= 0.8;
+        e.walkAnim += 0.1;
+        if (e.castTimer <= 0) {
+          // Magic bolt
+          const ang = Math.atan2(py-ey, px-ex);
+          spawnProjectile(ex, ey, Math.cos(ang)*8, Math.sin(ang)*8, 20, '#884488', 'enemy', 8);
+          e.castTimer = 90;
+        }
+        if (e.summonTimer <= 0 && enemies.length < 8) {
+          enemies.push(makeZombie(e.x + (Math.random()<0.5?-60:60), e.y));
+          e.summonTimer = 300;
+          spawnParticles(e.x+e.w/2, e.y+e.h/2, 10, '#884488', 3, 3, 25, 4);
+        }
+      } else {
+        e.vx *= 0.8;
+      }
+      break;
+
+    case 'berserker':
+      if (inRange) {
+        e.facing = dir;
+        e.walkAnim += 0.2;
+        if (e.chargeTimer > 0) e.chargeTimer--;
+        if (e.charging) {
+          e.vx = e.chargeDir * e.speed * 4;
+          if (Math.abs(e.x + e.w/2 - px) < 40) {
+            playerTakeDamage(35);
+            e.charging = false;
+            e.vx = 0;
+          }
+          if (e.x < 0 || e.x + e.w > GAME_W) {
+            e.charging = false;
+            e.vx = 0;
+          }
+        } else {
+          e.vx = dir * e.speed;
+          if (e.chargeTimer <= 0) {
+            e.charging = true;
+            e.chargeDir = dir;
+            e.chargeTimer = 150;
+            screenShake(5, 8);
+            spawnParticles(e.x+e.w/2, e.y+e.h, 10, '#cc4422', 5, 2, 20, 5);
+          }
+          if (d < 55 && e.attackCooldown <= 0) {
+            playerTakeDamage(22);
+            e.attackCooldown = 45;
+          }
+        }
+        if (e.attackCooldown > 0) e.attackCooldown--;
+      } else {
+        e.vx *= 0.9;
+      }
+      break;
+
+    case 'undead_king':
+      updateUndeadKing(e, player, enemies);
+      break;
+  }
+
+  // Physics for ground enemies
+  e.x += e.vx;
+  e.y += e.vy;
+
+  // Platform collision
+  e.onGround = false;
+  platforms.forEach(pl => {
+    if (e.vy >= 0 &&
+        e.x + e.w > pl.x + 4 &&
+        e.x < pl.x + pl.w - 4 &&
+        e.y + e.h > pl.y &&
+        e.y + e.h < pl.y + pl.h + 15) {
+      e.y = pl.y - e.h;
+      e.vy = 0;
+      e.onGround = true;
+    }
+  });
+
+  // World bounds
+  e.x = clamp(e.x, 0, GAME_W - e.w);
+}
+
+function updateUndeadKing(boss, player, enemies) {
+  const px = player.x + player.w/2;
+  const py = player.y + player.h/2;
+  const bx = boss.x + boss.w/2;
+  const by = boss.y + boss.h/2;
+  const d = dist(bx, by, px, py);
+  const dir = px > bx ? 1 : -1;
+  boss.facing = dir;
+
+  // Phase transitions
+  const hpRatio = boss.hp / boss.maxHp;
+  if (hpRatio <= 0.5 && boss.phase < 2) {
+    boss.phase = 2;
+    boss.summonTimer = 60;
+    screenShake(15, 20);
+    spawnParticles(bx, by, 30, '#ff8844', 8, 8, 50, 6);
+  }
+  if (hpRatio <= 0.25 && boss.phase < 3) {
+    boss.phase = 3;
+    boss.speed = 3.5;
+    screenShake(20, 30);
+    spawnParticles(bx, by, 40, '#ff4400', 10, 10, 60, 7);
+  }
+
+  if (boss.swordTimer > 0) boss.swordTimer--;
+  if (boss.phaseTimer > 0) boss.phaseTimer--;
+
+  const speed = boss.speed * (boss.phase === 3 ? 1.4 : 1);
+  boss.vx = dir * speed;
+  boss.walkAnim += 0.15;
+
+  // Sword swipe
+  if (d < 90 && boss.swordTimer <= 0) {
+    if (!player.invincible && !player.blocking) {
+      playerTakeDamage(boss.phase === 3 ? 30 : 20);
+    }
+    boss.swordTimer = boss.phase === 3 ? 30 : 55;
+    player.attackHitboxes = []; // interrupt player
+  }
+
+  // Phase 2+: summon skeletons
+  if (boss.phase >= 2 && boss.summonTimer !== undefined) {
+    if (boss.summonTimer > 0) boss.summonTimer--;
+    else if (enemies.filter(e=>e.type!=='undead_king').length < 5) {
+      for (let i=0;i<2;i++) enemies.push(makeSkelArcher(boss.x+(i%2?60:-60), boss.y));
+      boss.summonTimer = 200;
+    }
+  }
+
+  // Ranged attack phase 2+
+  if (boss.phase >= 2 && boss.phaseTimer <= 0) {
+    const ang = Math.atan2(py-by, px-bx);
+    spawnProjectile(bx, by, Math.cos(ang)*10, Math.sin(ang)*10, 25, '#ff8844', 'enemy', 8);
+    boss.phaseTimer = boss.phase===3 ? 45 : 80;
+  }
+}
+
+// ============================================================
+// ENEMY DRAWING
+// ============================================================
+function drawEnemy(e) {
+  if (e.dead && e.deathTimer <= 0) return;
+  const alpha = e.dead ? e.deathTimer/20 : 1;
+  ctx.globalAlpha = alpha;
+
+  const ex = Math.round(e.x);
+  const ey = Math.round(e.y);
+
+  // Frozen tint
+  if (e.frozenTimer > 0) {
+    ctx.fillStyle = '#88eeff';
+    ctx.globalAlpha = 0.4 * alpha;
+    ctx.fillRect(ex-2, ey-2, e.w+4, e.h+4);
+    ctx.globalAlpha = alpha;
+  }
+
+  // Flash red when hit
+  if (e.flashTimer > 0 && Math.floor(e.flashTimer/2)%2===0) {
+    ctx.fillStyle = '#ff0000';
+    ctx.globalAlpha = 0.6 * alpha;
+    ctx.fillRect(ex, ey, e.w, e.h);
+    ctx.globalAlpha = alpha;
+  }
+
+  const bobY = e.onGround ? Math.sin(e.walkAnim)*2 : 0;
+
+  switch(e.type) {
+    case 'zombie': drawZombie(ex, ey+bobY, e); break;
+    case 'skel_archer': drawSkelArcher(ex, ey+bobY, e); break;
+    case 'bat': drawBat(ex, ey+Math.sin(Date.now()/300)*3, e); break;
+    case 'shield_guard': drawShieldGuard(ex, ey+bobY, e); break;
+    case 'explode_zombie': drawExplodeZombie(ex, ey+bobY, e); break;
+    case 'specter': drawSpecter(ex, ey+bobY, e); break;
+    case 'stone_golem': drawStoneGolem(ex, ey+bobY, e); break;
+    case 'witch': drawWitch(ex, ey+bobY, e); break;
+    case 'berserker': drawBerserker(ex, ey+bobY, e); break;
+    case 'undead_king': drawUndeadKing(ex, ey+bobY, e); break;
+  }
+
+  // HP bar above enemy
+  if (!e.dead && e.hp < e.maxHp) {
+    const bw = e.w + 10;
+    const bx2 = ex - 5;
+    const by2 = ey - 12;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#330000';
+    ctx.fillRect(bx2, by2, bw, 6);
+    ctx.fillStyle = e.hp/e.maxHp > 0.5 ? '#44cc44' : '#cc4422';
+    ctx.fillRect(bx2, by2, bw * (e.hp/e.maxHp), 6);
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+function drawZombie(x, y, e) {
+  const f = e.facing;
+  ctx.fillStyle = '#44aa44';
+  ctx.fillRect(x+4, y+10, 20, 14); // body
+  ctx.fillStyle = '#669966';
+  ctx.fillRect(x+5, y, 14, 12); // head
+  ctx.fillStyle = '#ff2200';
+  ctx.fillRect(x+(f>0?13:6), y+4, 4, 3); // eyes
+  ctx.fillStyle = '#336633';
+  ctx.fillRect(x+4, y+24, 8, 12);
+  ctx.fillRect(x+16, y+24, 8, 12);
+  // arms outstretched
+  ctx.fillStyle = '#44aa44';
+  ctx.fillRect(x+(f>0?20:-8), y+11, 8, 8);
+}
+
+function drawSkelArcher(x, y, e) {
+  const f = e.facing;
+  // bones white
+  ctx.fillStyle = '#eeddcc';
+  ctx.fillRect(x+4, y+10, 16, 14);
+  ctx.fillStyle = '#ccbbaa';
+  ctx.fillRect(x+5, y, 14, 12);
+  // eye sockets
+  ctx.fillStyle = '#220000';
+  ctx.fillRect(x+(f>0?12:5), y+3, 4, 4);
+  ctx.fillRect(x+(f>0?7:12), y+3, 4, 4);
+  ctx.fillStyle = '#eeddcc';
+  ctx.fillRect(x+4, y+24, 7, 12);
+  ctx.fillRect(x+13, y+24, 7, 12);
+  // bow
+  ctx.fillStyle = '#664422';
+  ctx.fillRect(x+(f>0?20:0), y+10, 5, 16);
+}
+
+function drawBat(x, y, e) {
+  ctx.fillStyle = '#664488';
+  ctx.fillRect(x+6, y+4, 10, 8); // body
+  ctx.fillStyle = '#442266';
+  // wings
+  ctx.fillRect(x-2, y, 8, 10);
+  ctx.fillRect(x+e.w-6, y, 8, 10);
+  ctx.fillStyle = '#ff2200';
+  ctx.fillRect(x+8, y+3, 3, 3);
+  ctx.fillRect(x+11, y+3, 3, 3);
+}
+
+function drawShieldGuard(x, y, e) {
+  const f = e.facing;
+  ctx.fillStyle = '#556677';
+  ctx.fillRect(x+5, y+12, 22, 16);
+  ctx.fillStyle = '#667788';
+  ctx.fillRect(x+7, y+2, 18, 12);
+  // shield
+  ctx.fillStyle = '#aabbcc';
+  ctx.fillRect(x+(f>0?24:0), y+8, 14, 22);
+  ctx.fillStyle = '#778899';
+  ctx.fillRect(x+(f>0?26:2), y+12, 10, 10);
+  ctx.fillStyle = '#556677';
+  ctx.fillRect(x+5, y+28, 10, 12);
+  ctx.fillRect(x+17, y+28, 10, 12);
+}
+
+function drawExplodeZombie(x, y, e) {
+  const f = e.facing;
+  const pulse = e.exploding ? Math.sin(Date.now()/50)*4 : 0;
+  ctx.fillStyle = e.exploding ? '#ff8800' : '#aacc00';
+  ctx.fillRect(x+2, y+8+pulse/2, 24, 16);
+  ctx.fillStyle = '#88aa00';
+  ctx.fillRect(x+5, y, 18, 12);
+  ctx.fillStyle = '#ff2200';
+  ctx.fillRect(x+(f>0?16:5), y+4, 4, 4);
+  if (e.exploding) {
+    ctx.fillStyle = '#ffff00';
+    ctx.globalAlpha *= 0.7;
+    ctx.fillRect(x-4+pulse, y-4+pulse, e.w+8-pulse*2, e.h+8-pulse*2);
+    ctx.globalAlpha = 1;
+  }
+  ctx.fillStyle = '#aacc00';
+  ctx.fillRect(x+4, y+24, 8, 12);
+  ctx.fillRect(x+16, y+24, 8, 12);
+}
+
+function drawSpecter(x, y, e) {
+  ctx.globalAlpha *= e.alpha;
+  ctx.fillStyle = '#aa88ff';
+  // Ghostly body
+  for (let i=0;i<6;i++) {
+    ctx.fillRect(x+2+i*4, y+10, 4, 20+Math.sin(Date.now()/200+i)*3);
+  }
+  ctx.fillStyle = '#cc99ff';
+  ctx.fillRect(x+4, y, 18, 12); // head
+  ctx.fillStyle = '#220044';
+  ctx.fillRect(x+7, y+3, 4, 5);
+  ctx.fillRect(x+15, y+3, 4, 5);
+  ctx.globalAlpha /= e.alpha;
+}
+
+function drawStoneGolem(x, y, e) {
+  const f = e.facing;
+  ctx.fillStyle = '#888877';
+  // massive body
+  ctx.fillRect(x+4, y+20, 48, 30);
+  ctx.fillStyle = '#999988';
+  ctx.fillRect(x+8, y+4, 40, 20); // head
+  ctx.fillStyle = '#ffcc00';
+  ctx.fillRect(x+(f>0?30:14), y+10, 8, 6); // eyes
+  // arms
+  ctx.fillStyle = '#777766';
+  ctx.fillRect(x+(f>0?48:-12), y+20, 12, 20);
+  ctx.fillRect(x+(f>0?-12:48), y+20, 12, 20);
+  ctx.fillStyle = '#888877';
+  ctx.fillRect(x+8, y+50, 16, 14);
+  ctx.fillRect(x+32, y+50, 16, 14);
+}
+
+function drawWitch(x, y, e) {
+  const f = e.facing;
+  ctx.fillStyle = '#442244';
+  ctx.fillRect(x+4, y+12, 20, 16);
+  ctx.fillStyle = '#884488';
+  ctx.fillRect(x+5, y+2, 18, 12); // head
+  // hat
+  ctx.fillStyle = '#220022';
+  ctx.fillRect(x+3, y, 22, 5);
+  ctx.fillRect(x+8, y-10, 12, 12);
+  ctx.fillStyle = '#ff88ff';
+  ctx.fillRect(x+(f>0?15:4), y+5, 5, 5); // eye
+  // wand
+  ctx.fillStyle = '#cc99ff';
+  ctx.fillRect(x+(f>0?22:-4), y+10, 4, 16);
+  ctx.fillStyle = '#ffff88';
+  ctx.beginPath();
+  ctx.arc(x+(f>0?24:0), y+10, 5, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#442244';
+  ctx.fillRect(x+5, y+28, 8, 12);
+  ctx.fillRect(x+15, y+28, 8, 12);
+}
+
+function drawBerserker(x, y, e) {
+  const f = e.facing;
+  const rageColor = e.charging ? '#ff2200' : '#cc4422';
+  ctx.fillStyle = rageColor;
+  ctx.fillRect(x+4, y+14, 26, 18);
+  ctx.fillStyle = '#dd6644';
+  ctx.fillRect(x+6, y+2, 22, 14);
+  // horned helmet
+  ctx.fillStyle = '#888888';
+  ctx.fillRect(x+4, y, 26, 6);
+  ctx.fillRect(x+4, y-6, 6, 8);
+  ctx.fillRect(x+24, y-6, 6, 8);
+  ctx.fillStyle = '#ff4400';
+  ctx.fillRect(x+(f>0?20:8), y+6, 5, 5);
+  // big sword
+  ctx.fillStyle = '#aaaaaa';
+  ctx.fillRect(x+(f>0?28:0), y+6, 8, 30);
+  ctx.fillStyle = '#cc4422';
+  ctx.fillRect(x+4, y+32, 12, 14);
+  ctx.fillRect(x+18, y+32, 12, 14);
+}
+
+function drawUndeadKing(x, y, e) {
+  const f = e.facing;
+  const phase = e.phase;
+  const aura = phase===3 ? '#ff4400' : phase===2 ? '#ff8844' : '#ffcc66';
+  // Glow aura
+  ctx.globalAlpha *= 0.2;
+  ctx.fillStyle = aura;
+  ctx.fillRect(x-8, y-8, e.w+16, e.h+16);
+  ctx.globalAlpha /= 0.2;
+
+  // Crown
+  ctx.fillStyle = '#ffcc00';
+  ctx.fillRect(x+10, y-8, 40, 8);
+  for (let i=0;i<4;i++) {
+    ctx.fillRect(x+12+i*10, y-16, 8, 10);
+  }
+
+  // Body
+  ctx.fillStyle = phase===3?'#aa2200':phase===2?'#884422':'#664422';
+  ctx.fillRect(x+6, y+20, 48, 28);
+  // Head
+  ctx.fillStyle = '#ccbbaa';
+  ctx.fillRect(x+8, y+2, 44, 20);
+  // Eyes
+  ctx.fillStyle = phase===3?'#ff0000':'#ff8800';
+  ctx.fillRect(x+(f>0?36:14), y+8, 8, 8);
+  // Armor
+  ctx.fillStyle = '#888888';
+  ctx.fillRect(x+8, y+18, 44, 8);
+  // Crown gems
+  ctx.fillStyle = '#ff4444';
+  ctx.fillRect(x+16, y-14, 6, 6);
+  ctx.fillRect(x+29, y-14, 6, 6);
+
+  // Sword
+  ctx.fillStyle = '#ccddff';
+  ctx.fillRect(x+(f>0?52:-14), y+8, 14, 40);
+  ctx.fillStyle = '#aaaaaa';
+  ctx.fillRect(x+(f>0?48:-8), y+20, 8, 6);
+
+  // Phase shield (phase 1)
+  if (phase === 1) {
+    ctx.fillStyle = '#4488aa';
+    ctx.globalAlpha *= 0.5;
+    ctx.fillRect(x+(f>0?-14:e.w+2), y+10, 12, 36);
+    ctx.globalAlpha /= 0.5;
+  }
+
+  // Legs
+  ctx.fillStyle = '#442200';
+  ctx.fillRect(x+10, y+48, 16, 24);
+  ctx.fillRect(x+34, y+48, 16, 24);
+}
+
+// ============================================================
+// ROOM / LEVEL GENERATION
+// ============================================================
+let currentRoom = 0;
+let rooms = [];
+let currentRoomData = null;
+let roomTransitionTimer = 0;
+let gameState = 'playing'; // playing, gameover, win, transition, title
+let enemies = [];
+let chests = [];
+let doors = [];
+let platforms = [];
+
+function generateRoom(roomIndex) {
+  const isBoss = roomIndex === 6;
+  const isMiniBoss = [2, 4].includes(roomIndex);
+  const biome = BIOMES[Math.min(Math.floor(roomIndex/2), 2)];
+
+  const pls = [];
+  // Ground (always)
+  pls.push({ x:0, y:GROUND_Y, w:GAME_W, h:80, color:biome.floor });
+  // Random platforms
+  const numPlats = isBoss ? 3 : randInt(4, 7);
+  for (let i=0; i<numPlats; i++) {
+    const pw = randInt(80, 200);
+    const px2 = randInt(60, GAME_W-pw-60);
+    const py = randInt(GROUND_Y-200, GROUND_Y-80);
+    pls.push({ x:px2, y:py, w:pw, h:24, color:biome.floor });
+  }
+
+  // Enemies
+  const ens = [];
+  if (!isBoss) {
+    if (isMiniBoss) {
+      if (roomIndex === 2) ens.push(makeStoneGolem(GAME_W/2-28, GROUND_Y-70));
+      if (roomIndex === 4) {
+        ens.push(makeWitch(GAME_W/2-14, GROUND_Y-44));
+        ens.push(makeBerserker(GAME_W/2+120, GROUND_Y-48));
+      }
+    } else {
+      const types = ['zombie','skel_archer','bat','shield_guard','explode_zombie','specter'];
+      const count = randInt(3, 6);
+      for (let i=0; i<count; i++) {
+        const t = types[randInt(0, types.length-1)];
+        const ex2 = randInt(200, GAME_W-100);
+        switch(t) {
+          case 'zombie': ens.push(makeZombie(ex2, GROUND_Y-36)); break;
+          case 'skel_archer': ens.push(makeSkelArcher(ex2, GROUND_Y-34)); break;
+          case 'bat': ens.push(makeBat(ex2, GROUND_Y-200)); break;
+          case 'shield_guard': ens.push(makeShieldGuard(ex2, GROUND_Y-40)); break;
+          case 'explode_zombie': ens.push(makeExplodeZombie(ex2, GROUND_Y-34)); break;
+          case 'specter': ens.push(makeSpecter(ex2, GROUND_Y-36)); break;
+        }
+      }
+    }
+  } else {
+    ens.push(makeUndeadKing(GAME_W/2-30, GROUND_Y-76));
+  }
+
+  // Chest (not on boss room)
+  const cs = [];
+  if (!isBoss && Math.random() < 0.6) {
+    cs.push({ x: randInt(100, GAME_W-120), y:GROUND_Y-50, w:40, h:40, open:false });
+  }
+
+  // Door (right side exit)
+  const ds = [];
+  ds.push({ x: GAME_W-50, y: GROUND_Y-80, w:40, h:80, toRoom: roomIndex+1, locked: !isBoss });
+
+  return { platforms: pls, enemies: ens, chests: cs, doors: ds, biome, roomIndex };
+}
+
+function loadRoom(roomIndex) {
+  currentRoom = roomIndex;
+  currentRoomData = generateRoom(roomIndex);
+  platforms = currentRoomData.platforms;
+  enemies = currentRoomData.enemies;
+  chests = currentRoomData.chests;
+  doors = currentRoomData.doors;
+  // Reset player position
+  player.x = 80;
+  player.y = GROUND_Y - player.h - 10;
+  player.vx = 0;
+  player.vy = 0;
+  player.attackHitboxes = [];
+  projectiles.length = 0;
+  particles.length = 0;
+}
+
+// ============================================================
+// CHEST INTERACTION
+// ============================================================
+function checkChestInteraction() {
+  chests.forEach(c => {
+    if (c.open) return;
+    if (rectsOverlap(player.x, player.y, player.w, player.h, c.x, c.y, c.w, c.h)) {
+      if (justPressed['KeyE'] || justPressed['ArrowUp'] || justPressed['KeyW']) {
+        c.open = true;
+        // Give random weapon
+        const wk = WEAPON_KEYS[randInt(0, WEAPON_KEYS.length-1)];
+        const newW = makeWeapon(wk);
+        if (!player.weapons[0]) player.weapons[0] = newW;
+        else if (!player.weapons[1]) player.weapons[1] = newW;
+        else player.weapons[player.weaponSlot] = newW;
+        spawnParticles(c.x+c.w/2, c.y, 15, '#ffd700', 4, 5, 40, 5);
+        spawnDmgNumber(c.x+c.w/2, c.y-10, newW.name, '#ffd700');
+      }
+    }
+  });
+}
+
+function drawChests() {
+  chests.forEach(c => {
+    if (c.open) {
+      ctx.fillStyle = '#664400';
+      ctx.fillRect(c.x, c.y+20, c.w, c.h-20);
+      ctx.fillStyle = '#442200';
+      ctx.fillRect(c.x+2, c.y+20, c.w-4, 8);
+    } else {
+      ctx.fillStyle = '#884400';
+      ctx.fillRect(c.x, c.y, c.w, c.h);
+      ctx.fillStyle = '#cc6600';
+      ctx.fillRect(c.x+4, c.y+4, c.w-8, c.h-8);
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillRect(c.x+c.w/2-6, c.y+c.h/2-5, 12, 10); // lock
+      // Interaction hint
+      if (rectsOverlap(player.x, player.y, player.w, player.h, c.x, c.y, c.w, c.h)) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('[E] Open', c.x+c.w/2, c.y-8);
+        ctx.textAlign = 'left';
+      }
+    }
+  });
+}
+
+// ============================================================
+// DOOR / TRANSITION
+// ============================================================
+function checkDoors() {
+  doors.forEach(d => {
+    // Unlock door when all enemies dead
+    const aliveEnemies = enemies.filter(e => !e.dead);
+    if (aliveEnemies.length === 0) d.locked = false;
+
+    if (!d.locked && rectsOverlap(player.x, player.y, player.w, player.h, d.x, d.y, d.w, d.h)) {
+      if (currentRoom >= 6) {
+        gameState = 'win';
+      } else {
+        loadRoom(currentRoom + 1);
+        gameState = 'transition';
+        roomTransitionTimer = 30;
+      }
+    }
+  });
+}
+
+function drawDoors() {
+  doors.forEach(d => {
+    const aliveEnemies = enemies.filter(e => !e.dead);
+    const locked = aliveEnemies.length > 0;
+    ctx.fillStyle = locked ? '#441111' : '#114411';
+    ctx.fillRect(d.x, d.y, d.w, d.h);
+    ctx.fillStyle = locked ? '#882222' : '#228822';
+    ctx.fillRect(d.x+4, d.y+4, d.w-8, d.h*0.7);
+    if (locked) {
+      ctx.fillStyle = '#ff4444';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('LOCKED', d.x+d.w/2, d.y-5);
+    } else {
+      ctx.fillStyle = '#44ff44';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('EXIT', d.x+d.w/2, d.y-5);
+    }
+    ctx.textAlign = 'left';
+  });
+}
+
+// ============================================================
+// BACKGROUND DRAWING
+// ============================================================
+function drawBackground(biome) {
+  // Sky/dungeon bg
+  ctx.fillStyle = biome.bg;
+  ctx.fillRect(0, 0, GAME_W, GAME_H);
+
+  // Background details
+  if (biome.name === 'Dungeon') {
+    // Stone bricks
+    ctx.fillStyle = biome.fg;
+    for (let bx=0; bx<GAME_W; bx+=64) {
+      for (let by=0; by<GROUND_Y; by+=32) {
+        ctx.fillRect(bx+1, by+1, 62, 30);
+      }
+    }
+    // Torches
+    for (let tx=100; tx<GAME_W; tx+=200) {
+      drawTorch(tx, GROUND_Y-120, biome.torch);
+    }
+  } else if (biome.name === 'Forest') {
+    // Trees in bg
+    ctx.fillStyle = biome.fg;
+    for (let tx2=20; tx2<GAME_W; tx2+=80) {
+      ctx.fillRect(tx2+30, GROUND_Y-160, 20, 100);
+      ctx.fillStyle = '#1a5c1a';
+      ctx.beginPath();
+      ctx.arc(tx2+40, GROUND_Y-180, 40, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = biome.fg;
+    }
+    // Stars/fireflies
+    for (let i=0; i<20; i++) {
+      const fx = (i*137+Date.now()/50)%GAME_W;
+      const fy = 50 + (i*97)%200;
+      ctx.fillStyle = '#aaff88';
+      ctx.globalAlpha = 0.5+Math.sin(Date.now()/300+i)*0.5;
+      ctx.fillRect(fx, fy, 3, 3);
+      ctx.globalAlpha = 1;
+    }
+  } else if (biome.name === 'Castle') {
+    // Castle walls
+    ctx.fillStyle = biome.fg;
+    for (let bx2=0; bx2<GAME_W; bx2+=48) {
+      ctx.fillRect(bx2, 0, 44, GROUND_Y);
+    }
+    // Battlements
+    for (let bx3=0; bx3<GAME_W; bx3+=64) {
+      ctx.fillStyle = '#2a1010';
+      ctx.fillRect(bx3, 0, 48, 24);
+    }
+  }
+}
+
+function drawTorch(x, y, color) {
+  ctx.fillStyle = '#664400';
+  ctx.fillRect(x-3, y+8, 6, 16);
+  ctx.fillStyle = '#cc8800';
+  ctx.fillRect(x-5, y, 10, 10);
+  // Flame
+  const flicker = Math.sin(Date.now()/80)*3;
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.9;
+  ctx.beginPath();
+  ctx.arc(x, y-4+flicker, 7, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#ffff88';
+  ctx.globalAlpha = 0.6;
+  ctx.beginPath();
+  ctx.arc(x, y-6+flicker, 4, 0, Math.PI*2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  // Glow
+  ctx.globalAlpha = 0.08;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y, 50, 0, Math.PI*2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawPlatforms(platforms) {
+  platforms.forEach(pl => {
+    ctx.fillStyle = pl.color;
+    ctx.fillRect(pl.x, pl.y, pl.w, pl.h);
+    // Top edge highlight
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = 0.15;
+    ctx.fillRect(pl.x, pl.y, pl.w, 3);
+    ctx.globalAlpha = 1;
+    // Pixel texture
+    ctx.fillStyle = '#000000';
+    ctx.globalAlpha = 0.1;
+    for (let tx=pl.x; tx<pl.x+pl.w; tx+=8) {
+      ctx.fillRect(tx, pl.y+4, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+// ============================================================
+// HUD
+// ============================================================
+let speedrunTime = 0;
+let speedrunRunning = false;
+
+function drawHUD() {
+  // === Health bar (top left) ===
+  ctx.fillStyle = '#220000';
+  ctx.fillRect(10, 10, 200, 22);
+  const hpColor = player.hp > 60 ? '#44cc44' : player.hp > 30 ? '#cccc22' : '#cc2222';
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(10, 10, 200 * (player.hp/player.maxHp), 22);
+  ctx.strokeStyle = '#ff6600';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(10, 10, 200, 22);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 12px monospace';
+  ctx.fillText(`HP: ${player.hp}/${player.maxHp}`, 16, 26);
+
+  // Heart icons
+  const hearts = Math.ceil(player.hp / 10);
+  for (let i=0;i<10;i++) {
+    ctx.fillStyle = i < hearts ? '#ff2244' : '#441122';
+    ctx.fillRect(10+i*20, 36, 16, 14);
+    ctx.fillRect(12+i*20, 33, 6, 4);
+    ctx.fillRect(18+i*20, 33, 6, 4);
+  }
+
+  // === Speedrun Timer (top right) ===
+  const totalSecs = speedrunTime / 60;
+  const mins = Math.floor(totalSecs / 60);
+  const secs = Math.floor(totalSecs % 60);
+  const ms = Math.floor((totalSecs - Math.floor(totalSecs)) * 100);
+  const timeStr = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}.${String(ms).padStart(2,'0')}`;
+  ctx.fillStyle = '#000000';
+  ctx.globalAlpha = 0.5;
+  ctx.fillRect(GAME_W-170, 8, 160, 28);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#00ffcc';
+  ctx.font = 'bold 18px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(timeStr, GAME_W-12, 28);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#88aaaa';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('SPEEDRUN', GAME_W-12, 42);
+  ctx.textAlign = 'left';
+
+  // === Room counter (top center) ===
+  ctx.fillStyle = '#000000';
+  ctx.globalAlpha = 0.5;
+  ctx.fillRect(GAME_W/2-70, 8, 140, 28);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ffcc44';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`ROOM ${currentRoom+1} / 7`, GAME_W/2, 28);
+  const biomeStr = currentRoomData ? currentRoomData.biome.name.toUpperCase() : '';
+  ctx.fillStyle = '#aa8844';
+  ctx.font = '10px monospace';
+  ctx.fillText(biomeStr, GAME_W/2, 42);
+  ctx.textAlign = 'left';
+
+  // === Weapon slots (bottom center) ===
+  const slotW = 64, slotH = 64, gap = 10;
+  const totalW = slotW*2 + gap;
+  const slotX = GAME_W/2 - totalW/2;
+  const slotY = GAME_H - slotH - 12;
+
+  for (let i=0;i<2;i++) {
+    const wx = slotX + i*(slotW+gap);
+    const active = player.weaponSlot === i;
+    ctx.fillStyle = active ? '#223344' : '#111122';
+    ctx.fillRect(wx, slotY, slotW, slotH);
+    ctx.strokeStyle = active ? '#00aaff' : '#334455';
+    ctx.lineWidth = active ? 3 : 1;
+    ctx.strokeRect(wx, slotY, slotW, slotH);
+
+    const w = player.weapons[i];
+    if (w) {
+      drawWeaponIcon(wx+8, slotY+8, w);
+      ctx.fillStyle = active ? '#ffffff' : '#888888';
+      ctx.font = '8px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(w.name.split(' ')[0], wx+slotW/2, slotY+slotH-6);
+      ctx.textAlign = 'left';
+    } else {
+      ctx.fillStyle = '#333344';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('EMPTY', wx+slotW/2, slotY+slotH/2+4);
+      ctx.textAlign = 'left';
+    }
+
+    // Slot number
+    ctx.fillStyle = '#555566';
+    ctx.font = '10px monospace';
+    ctx.fillText(`${i+1}`, wx+4, slotY+14);
+  }
+  ctx.fillStyle = '#666677';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('[Q] switch', GAME_W/2, GAME_H-4);
+  ctx.textAlign = 'left';
+
+  // === Score/kills (bottom left) ===
+  ctx.fillStyle = '#000000';
+  ctx.globalAlpha = 0.5;
+  ctx.fillRect(8, GAME_H-54, 120, 46);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ffd700';
+  ctx.font = '12px monospace';
+  ctx.fillText(`Gold: ${player.gold}`, 14, GAME_H-36);
+  ctx.fillStyle = '#ff6644';
+  ctx.fillText(`Kills: ${player.kills}`, 14, GAME_H-18);
+
+  // === Boss health bar ===
+  const boss = enemies.find(e => e.type === 'undead_king' && !e.dead);
+  if (boss) {
+    drawBossHPBar(boss);
+  }
+
+  // Mini-boss HP bars
+  const miniBosses = enemies.filter(e => ['stone_golem','witch','berserker'].includes(e.type) && !e.dead);
+  miniBosses.forEach((mb, idx) => {
+    drawMiniBossHPBar(mb, idx);
+  });
+}
+
+function drawWeaponIcon(x, y, w) {
+  ctx.fillStyle = w.color;
+  switch(w.key) {
+    case 'vorpal_sword': case 'war_spear':
+      ctx.fillRect(x+4, y+10, 36, 8);
+      ctx.fillRect(x+14, y+6, 8, 16);
+      break;
+    case 'twin_daggers':
+      ctx.fillRect(x+4, y+8, 22, 6);
+      ctx.fillRect(x+4, y+18, 22, 6);
+      break;
+    case 'recurve_bow':
+      ctx.fillRect(x+10, y+4, 8, 40);
+      ctx.strokeStyle = w.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x+14, y+4); ctx.lineTo(x+14, y+44); ctx.stroke();
+      break;
+    case 'crossbow':
+      ctx.fillRect(x+4, y+16, 40, 8);
+      ctx.fillRect(x+18, y+4, 8, 30);
+      break;
+    case 'fire_grenade':
+      ctx.beginPath(); ctx.arc(x+24, y+28, 14, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillRect(x+21, y+8, 6, 10);
+      break;
+    case 'ice_shard':
+      ctx.fillRect(x+20, y+4, 8, 40);
+      ctx.fillRect(x+4, y+20, 40, 8);
+      break;
+    case 'lightning_whip':
+      for (let i=0;i<5;i++) {
+        ctx.fillStyle = i%2===0?w.color:'#ff8800';
+        ctx.fillRect(x+4+i*10, y+20+Math.sin(i)*6, 10, 6);
+      }
+      break;
+    case 'shield':
+      ctx.fillRect(x+10, y+4, 28, 40);
+      ctx.fillStyle = '#aabbcc';
+      ctx.fillRect(x+14, y+10, 20, 18);
+      break;
+    case 'scythe':
+      ctx.fillRect(x+4, y+24, 40, 6);
+      ctx.beginPath(); ctx.arc(x+44, y+16, 14, 0, Math.PI); ctx.fill();
+      break;
+    default:
+      ctx.fillRect(x+10, y+10, 28, 28);
+  }
+}
+
+function drawBossHPBar(boss) {
+  const barW = GAME_W - 200;
+  const barX = 100;
+  const barY = GAME_H - 30;
+  const barH = 20;
+
+  ctx.fillStyle = '#000000';
+  ctx.globalAlpha = 0.7;
+  ctx.fillRect(barX-5, barY-20, barW+10, barH+25);
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = '#330000';
+  ctx.fillRect(barX, barY, barW, barH);
+
+  const hpRatio = boss.hp / boss.maxHp;
+  const hpColor = hpRatio > 0.5 ? '#cc4422' : hpRatio > 0.25 ? '#ff6600' : '#ff0000';
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(barX, barY, barW * hpRatio, barH);
+
+  // Phase markers
+  ctx.fillStyle = '#ffffff';
+  ctx.globalAlpha = 0.4;
+  ctx.fillRect(barX + barW*0.5, barY, 3, barH);
+  ctx.fillRect(barX + barW*0.25, barY, 3, barH);
+  ctx.globalAlpha = 1;
+
+  ctx.strokeStyle = '#ff4400';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  ctx.fillStyle = '#ffcc44';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`THE UNDEAD KING  ${boss.hp}/${boss.maxHp}  [Phase ${boss.phase}]`, GAME_W/2, barY-5);
+  ctx.textAlign = 'left';
+}
+
+function drawMiniBossHPBar(mb, idx) {
+  const barW = 300;
+  const barX = GAME_W/2-150;
+  const barY = 55 + idx*30;
+  const barH = 14;
+
+  ctx.fillStyle = '#220000';
+  ctx.globalAlpha = 0.7;
+  ctx.fillRect(barX-2, barY-12, barW+4, barH+16);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#551100';
+  ctx.fillRect(barX, barY, barW, barH);
+  ctx.fillStyle = '#cc6622';
+  ctx.fillRect(barX, barY, barW * (mb.hp/mb.maxHp), barH);
+  ctx.strokeStyle = '#ff6600';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, barW, barH);
+  ctx.fillStyle = '#ffaa44';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'center';
+  const names = { stone_golem:'Stone Golem', witch:'Witch', berserker:'Berserker Knight' };
+  ctx.fillText(`${names[mb.type]||mb.type}  ${mb.hp}/${mb.maxHp}`, GAME_W/2, barY-2);
+  ctx.textAlign = 'left';
+}
+
+// ============================================================
+// TITLE SCREEN
+// ============================================================
+function drawTitleScreen() {
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+
+  // Animated bg
+  for (let i=0;i<30;i++) {
+    const x = (i*137.5+Date.now()/20)%GAME_W;
+    const y = (i*89.3)%GAME_H;
+    ctx.fillStyle = '#1a1a3a';
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Title
+  ctx.fillStyle = '#ff4400';
+  ctx.font = 'bold 64px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('PIXEL', GAME_W/2, 160);
+  ctx.fillStyle = '#ffcc00';
+  ctx.fillText('SPEEDRUN', GAME_W/2, 230);
+
+  ctx.fillStyle = '#888888';
+  ctx.font = '16px monospace';
+  ctx.fillText('A Dead Cells Inspired Adventure', GAME_W/2, 270);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '14px monospace';
+  ctx.fillText('CONTROLS:', GAME_W/2, 320);
+  ctx.fillStyle = '#aaaaff';
+  ctx.font = '12px monospace';
+  ctx.fillText('A/D or Arrow Keys: Move   W/Space: Jump   Shift: Dash', GAME_W/2, 345);
+  ctx.fillText('J/Z: Attack   Q: Switch Weapon   E: Open Chest', GAME_W/2, 365);
+  ctx.fillText('S + Shield: Block', GAME_W/2, 385);
+
+  ctx.fillStyle = Math.floor(Date.now()/500)%2===0?'#00ffcc':'#00aa88';
+  ctx.font = 'bold 20px monospace';
+  ctx.fillText('Press SPACE or ENTER to Start!', GAME_W/2, 440);
+
+  ctx.fillStyle = '#444455';
+  ctx.font = '11px monospace';
+  ctx.fillText('6 Rooms + Boss Fight | 10 Weapons | Multiple Enemy Types', GAME_W/2, 490);
+  ctx.fillText('Kill all enemies to unlock the exit door in each room', GAME_W/2, 510);
+
+  ctx.textAlign = 'left';
+}
+
+// ============================================================
+// GAME OVER SCREEN
+// ============================================================
+function drawGameOverScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+
+  ctx.fillStyle = '#cc2222';
+  ctx.font = 'bold 72px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('YOU DIED', GAME_W/2, GAME_H/2-60);
+
+  const totalSecs = speedrunTime / 60;
+  const mins = Math.floor(totalSecs/60);
+  const secs = Math.floor(totalSecs%60);
+  ctx.fillStyle = '#888888';
+  ctx.font = '18px monospace';
+  ctx.fillText(`Time: ${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`, GAME_W/2, GAME_H/2);
+  ctx.fillText(`Kills: ${player.kills}   Gold: ${player.gold}   Room: ${currentRoom+1}/7`, GAME_W/2, GAME_H/2+30);
+
+  ctx.fillStyle = Math.floor(Date.now()/400)%2===0?'#ffffff':'#aaaaaa';
+  ctx.font = '22px monospace';
+  ctx.fillText('Press SPACE or ENTER to Retry', GAME_W/2, GAME_H/2+90);
+
+  ctx.textAlign = 'left';
+}
+
+// ============================================================
+// WIN SCREEN
+// ============================================================
+function drawWinScreen() {
+  ctx.fillStyle = 'rgba(0,0,50,0.85)';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+
+  // Stars
+  for (let i=0;i<50;i++) {
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = Math.sin(Date.now()/200+i)*0.5+0.5;
+    ctx.fillRect((i*173)%GAME_W, (i*97)%GAME_H, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = '#ffcc00';
+  ctx.font = 'bold 56px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('VICTORY!', GAME_W/2, 150);
+
+  ctx.fillStyle = '#00ffcc';
+  ctx.font = '22px monospace';
+  ctx.fillText('THE UNDEAD KING IS DEFEATED!', GAME_W/2, 210);
+
+  const totalSecs = speedrunTime / 60;
+  const mins = Math.floor(totalSecs/60);
+  const secs = Math.floor(totalSecs%60);
+  const ms2 = Math.floor((totalSecs-Math.floor(totalSecs))*100);
+  const timeStr = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}.${String(ms2).padStart(2,'0')}`;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 28px monospace';
+  ctx.fillText(`Final Time: ${timeStr}`, GAME_W/2, 280);
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = '20px monospace';
+  ctx.fillText(`Kills: ${player.kills}   Gold: ${player.gold}`, GAME_W/2, 320);
+
+  // Rating
+  let rating = 'S';
+  let ratingColor = '#ff8800';
+  if (totalSecs < 180) { rating = 'S+'; ratingColor = '#ffff00'; }
+  else if (totalSecs < 300) { rating = 'S'; ratingColor = '#ff8800'; }
+  else if (totalSecs < 480) { rating = 'A'; ratingColor = '#44ccff'; }
+  else { rating = 'B'; ratingColor = '#44ff44'; }
+
+  ctx.fillStyle = ratingColor;
+  ctx.font = 'bold 80px monospace';
+  ctx.fillText(rating, GAME_W/2, 420);
+  ctx.font = '14px monospace';
+  ctx.fillStyle = '#888888';
+  ctx.fillText('S+ < 3:00   S < 5:00   A < 8:00', GAME_W/2, 445);
+
+  ctx.fillStyle = Math.floor(Date.now()/400)%2===0?'#ffffff':'#aaaaaa';
+  ctx.font = '20px monospace';
+  ctx.fillText('Press SPACE to Play Again', GAME_W/2, 495);
+
+  ctx.textAlign = 'left';
+}
+
+// ============================================================
+// ROOM TRANSITION
+// ============================================================
+function drawRoomTransition(timer) {
+  const alpha = timer / 30;
+  ctx.fillStyle = '#000000';
+  ctx.globalAlpha = alpha;
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// GAME INITIALIZATION
+// ============================================================
+function initGame() {
+  // Reset player
+  player.x = 80; player.y = 200;
+  player.vx = 0; player.vy = 0;
+  player.hp = 100; player.maxHp = 100;
+  player.invincible = false; player.invTimer = 0;
+  player.dashTimer = 0; player.dashCooldown = 0;
+  player.isDashing = false; player.blocking = false;
+  player.weapons = [makeWeapon('vorpal_sword'), makeWeapon('recurve_bow')];
+  player.weaponSlot = 0;
+  player.attackTimer = 0; player.attackHitboxes = [];
+  player.gold = 0; player.kills = 0;
+  player.dead = false; player.deathTimer = 0;
+  player.walkAnim = 0; player.attackAnim = 0;
+
+  // Reset collections
+  projectiles.length = 0;
+  particles.length = 0;
+  dmgNumbers.length = 0;
+
+  // Reset timer
+  speedrunTime = 0;
+  speedrunRunning = true;
+
+  // Load first room
+  loadRoom(0);
+  gameState = 'playing';
+}
+
+// ============================================================
+// MAIN GAME LOOP
+// ============================================================
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+  const dt = timestamp - lastTime;
+  lastTime = timestamp;
+
+  // Hit stop
+  if (hitStopFrames > 0) {
+    hitStopFrames--;
+    clearJust();
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  updateShake();
+  ctx.save();
+  ctx.translate(Math.round(shakeX), Math.round(shakeY));
+
+  if (gameState === 'title') {
+    drawTitleScreen();
+    if (justPressed['Space'] || justPressed['Enter']) {
+      initGame();
+      gameState = 'playing';
+    }
+  }
+  else if (gameState === 'playing') {
+    // Update timer
+    speedrunTime++;
+
+    // Update
+    updatePlayer(platforms);
+    updatePlayerHitboxes(enemies);
+    enemies.forEach(e => updateEnemy(e, platforms, player, enemies));
+    // Remove fully dead enemies
+    for (let i=enemies.length-1;i>=0;i--) {
+      if (enemies[i].dead && enemies[i].deathTimer <= 0) enemies.splice(i,1);
+    }
+    updateProjectiles(platforms, player, enemies);
+    updateParticles();
+    updateDmgNumbers();
+    checkChestInteraction();
+    checkDoors();
+
+    // Draw
+    const biome = currentRoomData ? currentRoomData.biome : BIOMES[0];
+    drawBackground(biome);
+    drawPlatforms(platforms);
+    drawDoors();
+    drawChests();
+    enemies.forEach(drawEnemy);
+    drawProjectiles();
+    drawParticles();
+    drawPlayer();
+    drawDmgNumbers();
+    drawHUD();
+  }
+  else if (gameState === 'transition') {
+    roomTransitionTimer--;
+    const biome = currentRoomData ? currentRoomData.biome : BIOMES[0];
+    drawBackground(biome);
+    drawPlatforms(platforms);
+    drawDoors();
+    drawChests();
+    enemies.forEach(drawEnemy);
+    drawPlayer();
+    drawHUD();
+    drawRoomTransition(roomTransitionTimer);
+    if (roomTransitionTimer <= 0) gameState = 'playing';
+  }
+  else if (gameState === 'gameover') {
+    const biome = currentRoomData ? currentRoomData.biome : BIOMES[0];
+    drawBackground(biome);
+    drawPlatforms(platforms);
+    drawParticles();
+    updateParticles();
+    drawGameOverScreen();
+    if (justPressed['Space'] || justPressed['Enter'] || justPressed['KeyR']) {
+      initGame();
+    }
+  }
+  else if (gameState === 'win') {
+    speedrunRunning = false;
+    drawWinScreen();
+    if (justPressed['Space'] || justPressed['Enter']) {
+      initGame();
+    }
+  }
+
+  ctx.restore();
+  clearJust();
+  requestAnimationFrame(gameLoop);
+}
+
+// ============================================================
+// START
+// ============================================================
+gameState = 'title';
+requestAnimationFrame(gameLoop);
+
+// Mouse click for attacking
+canvas.addEventListener('mousedown', e => {
+  if (e.button === 0) justPressed['Mouse0'] = true;
+});
+</script>
+</body>
+</html>
